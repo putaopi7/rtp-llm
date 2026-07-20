@@ -139,7 +139,8 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
         if (!writer->Write(outputs_pb)) {
             stream->reportError(ErrorCode::CANCELLED, "write outputs pb failed");
             RTP_LLM_LOG_WARNING("request [%s] write outputs pb failed", request_key.c_str());
-            return grpc::Status(grpc::StatusCode::INTERNAL, "request write outputs pb failed");
+            // WriterInterface uses false to signal that its downstream consumer has closed or cancelled.
+            return grpc::Status(grpc::StatusCode::CANCELLED, "request output consumer closed");
         }
         if (stream->hasEvent(StreamEvents::NeedRemoteGenerate)) {
             break;
@@ -291,13 +292,13 @@ grpc::Status LocalRpcServer::GetWorkerStatus(grpc::ServerContext*   context,
             task_details +=
                 "  req_id=" + std::to_string(task.request_id) + " batch_id=" + std::to_string(task.batch_id) + "\n";
         }
-        RTP_LLM_LOG_INFO("GetWorkerStatus response: request_latest_finished_version=%ld, "
-                         "response_latest_finished_version=%ld, "
-                         "finished_tasks_count=%ld\n%s",
-                         latest_finished_version,
-                         status_info.latest_finished_version,
-                         engine_schedule_info.finished_task_info_list.size(),
-                         task_details.c_str());
+        RTP_LLM_LOG_DEBUG("GetWorkerStatus response: request_latest_finished_version=%ld, "
+                          "response_latest_finished_version=%ld, "
+                          "finished_tasks_count=%ld\n%s",
+                          latest_finished_version,
+                          status_info.latest_finished_version,
+                          engine_schedule_info.finished_task_info_list.size(),
+                          task_details.c_str());
     }
 
     response->set_dp_size(status_info.dp_size);

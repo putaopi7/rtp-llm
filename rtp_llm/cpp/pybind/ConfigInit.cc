@@ -1303,7 +1303,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.specify_gpu_arch);
             },
             [](py::tuple t) {
-                if (t.size() < 14)
+                if (t.size() < 13)
                     throw std::runtime_error("Invalid state!");
                 RuntimeConfig c;
                 try {
@@ -1320,7 +1320,9 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.worker_grpc_addrs             = t[10].cast<std::vector<std::string>>();
                     c.worker_addrs                  = t[11].cast<std::vector<std::string>>();
                     c.all_worker_grpc_addrs         = t[12].cast<std::vector<std::string>>();
-                    c.specify_gpu_arch              = t[13].cast<std::string>();
+                    if (t.size() >= 14) {
+                        c.specify_gpu_arch = t[13].cast<std::string>();
+                    }
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("RuntimeConfig unpickle error: ") + e.what());
                 }
@@ -1717,12 +1719,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("max_rpc_timeout_ms", &PDSepConfig::max_rpc_timeout_ms)
         .def_readwrite("worker_port_offset", &PDSepConfig::worker_port_offset)
         .def_readwrite("decode_entrance", &PDSepConfig::decode_entrance)
-        .def_readwrite("batch_dispatch_timeout_ms", &PDSepConfig::batch_dispatch_timeout_ms)
-        .def_readwrite("batch_prepare_timeout_ms", &PDSepConfig::batch_prepare_timeout_ms)
-        .def_readwrite("batch_load_timeout_ms", &PDSepConfig::batch_load_timeout_ms)
-        .def_readwrite("prefill_enqueue_pool_size", &PDSepConfig::prefill_enqueue_pool_size)
-        .def_readwrite("prefill_worker_lambda_pool_size", &PDSepConfig::prefill_worker_lambda_pool_size)
         .def_readwrite("prefill_slot_pool_size", &PDSepConfig::prefill_slot_pool_size)
+        .def_readwrite("prefill_stop_stream_wait_timeout_ms", &PDSepConfig::prefill_stop_stream_wait_timeout_ms)
         .def("to_string", &PDSepConfig::to_string)
         .def(py::pickle(
             [](const PDSepConfig& self) {
@@ -1746,18 +1744,15 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.max_rpc_timeout_ms,
                                       self.worker_port_offset,
                                       self.decode_entrance,
-                                      self.batch_dispatch_timeout_ms,
-                                      self.batch_prepare_timeout_ms,
-                                      self.batch_load_timeout_ms,
-                                      self.prefill_enqueue_pool_size,
-                                      self.prefill_worker_lambda_pool_size,
-                                      self.prefill_slot_pool_size);
+                                      self.prefill_slot_pool_size,
+                                      self.prefill_stop_stream_wait_timeout_ms);
             },
             [](py::tuple t) {
-                if (t.size() < 26)
+                if (t.size() != 22 && t.size() < 25)
                     throw std::runtime_error("Invalid state!");
                 PDSepConfig c;
                 try {
+                    // Fields 0-19: basic fields (old 20-item baseline, always present)
                     c.role_type                       = t[0].cast<RoleType>();
                     c.cache_store_rdma_mode           = t[1].cast<bool>();
                     c.cache_store_listen_port         = t[2].cast<int64_t>();
@@ -1778,12 +1773,21 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.max_rpc_timeout_ms              = t[17].cast<int64_t>();
                     c.worker_port_offset              = t[18].cast<int64_t>();
                     c.decode_entrance                 = t[19].cast<bool>();
-                    c.batch_dispatch_timeout_ms       = t[20].cast<int64_t>();
-                    c.batch_prepare_timeout_ms        = t[21].cast<int64_t>();
-                    c.batch_load_timeout_ms           = t[22].cast<int64_t>();
-                    c.prefill_enqueue_pool_size       = t[23].cast<int64_t>();
-                    c.prefill_worker_lambda_pool_size = t[24].cast<int64_t>();
-                    c.prefill_slot_pool_size          = t[25].cast<int64_t>();
+                    if (t.size() == 22) {
+                        c.prefill_slot_pool_size              = t[20].cast<int64_t>();
+                        c.prefill_stop_stream_wait_timeout_ms = t[21].cast<int64_t>();
+                    } else {
+                        // Older tuples contain removed batch coordination settings.
+                        // The oldest supported layout additionally has batch_dispatch_timeout_ms at index 20.
+                        const size_t batch_config_offset = t.size() >= 26 ? 1 : 0;
+                        c.prefill_slot_pool_size         = t[24 + batch_config_offset].cast<int64_t>();
+                        // prefill_stop_stream_wait_timeout_ms is present only in 27-item legacy
+                        // tuples (at index 25 + batch_config_offset). For 25/26-item tuples it
+                        // keeps its default value (2000) from default construction.
+                        if (t.size() >= 26 + batch_config_offset) {
+                            c.prefill_stop_stream_wait_timeout_ms = t[25 + batch_config_offset].cast<int64_t>();
+                        }
+                    }
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("PDSepConfig unpickle error: ") + e.what());
                 }

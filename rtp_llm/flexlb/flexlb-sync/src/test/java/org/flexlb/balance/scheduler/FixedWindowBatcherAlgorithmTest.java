@@ -9,6 +9,7 @@ import org.flexlb.dao.master.WorkerStatus;
 import org.flexlb.service.monitor.BatchSchedulerReporter;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -28,6 +29,12 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+/**
+ * Tests for {@link FixedWindowBatcherAlgorithm}.
+ *
+ * <p>Verifies head wait time computation, queue deadline drop, and token-cap
+ * filtering behavior.
+ */
 class FixedWindowBatcherAlgorithmTest {
 
     @Test
@@ -139,11 +146,12 @@ class FixedWindowBatcherAlgorithmTest {
         when(endpoint.ipPort()).thenReturn("127.0.0.1:61000");
 
         BatchDecisionHandler handler = mock(BatchDecisionHandler.class);
+        long now = System.currentTimeMillis();
         BatcherContext context = context(
                 "test", endpoint, config, handler,
-                queueWith(enqueuedItem(1, 1, 60),
-                        enqueuedItem(2, 2, 50),
-                        enqueuedItem(3, 3, 30)),
+                queueWith(enqueuedItem(1, now - 3, 60),
+                        enqueuedItem(2, now - 2, 50),
+                        enqueuedItem(3, now - 1, 30)),
                 mock(BatchSchedulerReporter.class));
 
         new FixedWindowBatcherAlgorithm().processQueue(context);
@@ -175,8 +183,9 @@ class FixedWindowBatcherAlgorithmTest {
         when(endpoint.ipPort()).thenReturn("127.0.0.1:61000");
 
         BatchItem[] items = new BatchItem[requestCount];
+        long now = System.currentTimeMillis();
         for (int index = 0; index < requestCount; index++) {
-            items[index] = enqueuedItem(index + 1L, index + 1L, seqLen);
+            items[index] = enqueuedItem(index + 1L, now - 400 + index, seqLen);
         }
         BatchDecisionHandler handler = mock(BatchDecisionHandler.class);
         BatcherContext context = context(
@@ -216,9 +225,10 @@ class FixedWindowBatcherAlgorithmTest {
         when(endpoint.ipPort()).thenReturn("127.0.0.1:61000");
 
         BatchDecisionHandler handler = mock(BatchDecisionHandler.class);
+        long now = System.currentTimeMillis();
         BatcherContext context = context(
                 "test", endpoint, config, handler,
-                queueWith(enqueuedItem(1, 1, 60), enqueuedItem(2, 2, 40)),
+                queueWith(enqueuedItem(1, now - 2, 60), enqueuedItem(2, now - 1, 40)),
                 mock(BatchSchedulerReporter.class));
 
         new FixedWindowBatcherAlgorithm().processQueue(context);
@@ -240,7 +250,7 @@ class FixedWindowBatcherAlgorithmTest {
         PrefillEndpoint endpoint = mock(PrefillEndpoint.class);
         when(endpoint.getStatus()).thenReturn(status);
 
-        BatchItem item = enqueuedItem(1, 1, 100);
+        BatchItem item = enqueuedItem(1, System.currentTimeMillis(), 100);
         BatchDecisionHandler handler = mock(BatchDecisionHandler.class);
         BatcherContext context = context(
                 "test", endpoint, config, handler, queueWith(item),
@@ -251,6 +261,103 @@ class FixedWindowBatcherAlgorithmTest {
         verify(handler).onOfferFailure(eq(item), any(IllegalArgumentException.class));
         verify(handler, never()).onBatchReady(anyList(), any(DispatchMeta.class));
         assertEquals(0, context.size());
+    }
+
+    @Test
+    void processQueue_dropsExpiredHeadRequest() throws InterruptedException {
+        FixedWindowBatcherAlgorithm algo = new FixedWindowBatcherAlgorithm();
+
+        FlexlbConfig config = new FlexlbConfig();
+        config.setFlexlbBatchFixedMaxInflightBatches(0); // disable backpressure
+        config.setFlexlbBatchEnqueueDeadlineMs(100);     // 100ms queue deadline
+        config.setFlexlbBatchFixedWaitMs(10000);         // long window — don't trigger window timeout
+
+        long now = System.currentTimeMillis();
+        // Enqueued 200ms ago — exceeds the 100ms deadline
+        BatchItem head = enqueuedItem(1L, now - 200);
+        PriorityBlockingQueue<BatchItem> queue = queueWith(head);
+
+        BatchDecisionHandler handler = mock(BatchDecisionHandler.class);
+        BatcherContext ctx = new BatcherContext("test", null, config, handler, queue, mock(BatchSchedulerReporter.class));
+
+        algo.processQueue(ctx);
+
+        // The head should have been dropped via onExpired
+        Mockito.verify(handler).onExpired(head);
+        assertTrue(queue.isEmpty(), "Queue should be empty after dropping expired head");
+    }
+
+    @Test
+    void queueWaitMs_emptyQueue_returnsFixedWaitMs() {
+        FlexlbConfig config = new FlexlbConfig();
+        config.setFlexlbBatchFixedWaitMs(300L);
+        config.setFlexlbBatchSizeMax(8);
+
+        BatcherContext ctx = new BatcherContext("test", null, config, null,
+                queueWith(), mock(BatchSchedulerReporter.class));
+
+        assertEquals(300L, new FixedWindowBatcherAlgorithm().queueWaitMs(ctx));
+    }
+
+    @Test
+    void queueWaitMs_batchMaxOne_returnsZero() {
+        FlexlbConfig config = new FlexlbConfig();
+        config.setFlexlbBatchFixedWaitMs(300L);
+        config.setFlexlbBatchSizeMax(1);
+
+        BatcherContext ctx = new BatcherContext("test", null, config, null,
+                queueWithN(5, System.currentTimeMillis()), mock(BatchSchedulerReporter.class));
+
+        assertEquals(0L, new FixedWindowBatcherAlgorithm().queueWaitMs(ctx));
+    }
+
+    @Test
+    void queueWaitMs_fillingLastBatch_returnsZero() {
+        FlexlbConfig config = new FlexlbConfig();
+        config.setFlexlbBatchFixedWaitMs(300L);
+        config.setFlexlbBatchSizeMax(8);
+
+        BatcherContext ctx = new BatcherContext("test", null, config, null,
+                queueWithN(15, System.currentTimeMillis()), mock(BatchSchedulerReporter.class));
+
+        assertEquals(0L, new FixedWindowBatcherAlgorithm().queueWaitMs(ctx));
+    }
+
+    @Test
+    void queueWaitMs_partialBatchAfterDispatch_returnsFixedWaitMs() {
+        FlexlbConfig config = new FlexlbConfig();
+        config.setFlexlbBatchFixedWaitMs(300L);
+        config.setFlexlbBatchSizeMax(8);
+
+        BatcherContext ctx = new BatcherContext("test", null, config, null,
+                queueWithN(20, System.currentTimeMillis()), mock(BatchSchedulerReporter.class));
+
+        assertEquals(300L, new FixedWindowBatcherAlgorithm().queueWaitMs(ctx));
+    }
+
+    @Test
+    void queueWaitMs_expiredWindow_returnsZero() {
+        FlexlbConfig config = new FlexlbConfig();
+        config.setFlexlbBatchFixedWaitMs(300L);
+        config.setFlexlbBatchSizeMax(8);
+
+        BatcherContext ctx = new BatcherContext("test", null, config, null,
+                queueWithN(3, System.currentTimeMillis() - 400), mock(BatchSchedulerReporter.class));
+
+        assertEquals(0L, new FixedWindowBatcherAlgorithm().queueWaitMs(ctx));
+    }
+
+    @Test
+    void queueWaitMs_returnsRemainingWindow() {
+        FlexlbConfig config = new FlexlbConfig();
+        config.setFlexlbBatchFixedWaitMs(300L);
+        config.setFlexlbBatchSizeMax(8);
+
+        BatcherContext ctx = new BatcherContext("test", null, config, null,
+                queueWithN(3, System.currentTimeMillis() - 100), mock(BatchSchedulerReporter.class));
+        long waitMs = new FixedWindowBatcherAlgorithm().queueWaitMs(ctx);
+
+        assertTrue(waitMs >= 190 && waitMs <= 200, "Expected about 200ms, got " + waitMs);
     }
 
     // ---- helpers ----
@@ -288,6 +395,14 @@ class FixedWindowBatcherAlgorithmTest {
         PriorityBlockingQueue<BatchItem> queue = new PriorityBlockingQueue<>(11, Comparator.comparingLong(BatchItem::sortKey));
         for (BatchItem item : items) {
             queue.add(item);
+        }
+        return queue;
+    }
+
+    private static PriorityBlockingQueue<BatchItem> queueWithN(int count, long enqueuedAtMs) {
+        PriorityBlockingQueue<BatchItem> queue = queueWith();
+        for (int i = 0; i < count; i++) {
+            queue.add(enqueuedItem(i + 1L, enqueuedAtMs));
         }
         return queue;
     }

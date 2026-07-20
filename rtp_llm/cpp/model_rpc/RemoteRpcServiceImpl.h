@@ -2,7 +2,7 @@
 #include <memory>
 #include "grpc++/grpc++.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServiceImpl.h"
-#include "rtp_llm/cpp/model_rpc/PrefillRpcServer.h"
+#include "rtp_llm/cpp/model_rpc/PrefillBatchRpcServer.h"
 #include "rtp_llm/cpp/model_rpc/DecodeRpcServer.h"
 
 namespace rtp_llm {
@@ -130,8 +130,8 @@ public:
     }
 
 private:
-    std::shared_ptr<PrefillRpcServer> prefill_server_;
-    std::shared_ptr<DecodeRpcServer>  decode_server_;
+    std::shared_ptr<PrefillBatchRpcServer> prefill_server_;
+    std::shared_ptr<DecodeRpcServer>       decode_server_;
 };
 
 }  // namespace rtp_llm
