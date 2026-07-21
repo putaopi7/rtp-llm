@@ -138,16 +138,15 @@ private:
     torch::Tensor                            residual_scale_;
     TensorHolder                             buffer_holder_;
 
-    GraphBase*                                 graph_runner_{nullptr};
-    py::object                                 py_model_;
-    py::object                                 held_attn_pyobj_;
-    bool                                       enable_cuda_graph_{false};
-    bool                                       is_prefill_cuda_graph_mode_{false};
-    bool                                       use_spec_decoding_{false};
-    bool                                       enable_device_perf_{false};
-    bool                                       check_nan_{false};
-    bool                                       has_target_verify_attention_input_hook_{false};
-    bool                                       requires_grouped_physical_kv_tables_{false};
+    GraphBase* graph_runner_{nullptr};
+    py::object py_model_;
+    py::object held_attn_pyobj_;
+    bool       enable_cuda_graph_{false};
+    bool       is_prefill_cuda_graph_mode_{false};
+    bool       use_spec_decoding_{false};
+    bool       enable_device_perf_{false};
+    bool       check_nan_{false};
+
     std::unique_ptr<IContextParallelProcessor> context_parallel_processor_{nullptr};
     std::unique_ptr<CacheStoreAsyncWriter>     cache_store_async_writer_;
 
@@ -270,10 +269,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
 
     py::object py_init_result;
     // Always initialize py_model_ so it can be used as fallback when CUDA graph cannot run
-    py_model_                               = py_instance;
-    has_target_verify_attention_input_hook_ = py::hasattr(py_model_, "prepare_target_verify_attention_inputs");
-    requires_grouped_physical_kv_tables_    = py::hasattr(py_model_, "requires_grouped_physical_kv_tables")
-                                           && py_model_.attr("requires_grouped_physical_kv_tables").cast<bool>();
+    py_model_                 = py_instance;
     auto py_initialize_method = py_model_.attr("initialize");
     try {
         py_init_result = py_initialize_method(init_resources);
@@ -357,15 +353,16 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         } else {
             graph_params.num_tokens_per_bs = 1;
         }
-        // In speculative generation the target model has no steady-state
-        // single-token decode stage: every post-prefill forward is target
-        // verify. It uses decode-style operators, but remains a distinct
-        // multi-token phase. Warmup may not pass use_spec_decoding, so infer
-        // this phase from the target-model configuration as well.
-        const bool configured_target_verify = params.sp_config.type != SP_TYPE_NONE
-                                              && params.sp_config.gen_num_per_cycle > 0 && !params.model_id
-                                              && !is_prefill_cuda_graph_mode;
-        graph_params.is_target_verify = use_spec_decoding || configured_target_verify;
+        // Target-model decode path with SP enabled (num_tokens_per_bs>1,
+        // not prefill-graph, model_id==0) must set is_target_verify so the
+        // Python dispatch routes through forward_decode.  NormalExecutor's
+        // decodeWarmUp path defaults use_spec_decoding=false but still sees
+        // sp_config enabled, so infer the flag from config instead of
+        // relying solely on the constructor arg.
+        const bool is_target_verify_decode = params.sp_config.type != SP_TYPE_NONE
+                                             && params.sp_config.gen_num_per_cycle > 0 && !params.model_id
+                                             && !is_prefill_cuda_graph_mode;
+        graph_params.is_target_verify = use_spec_decoding || is_target_verify_decode;
         if (params.sp_config.type != SP_TYPE_NONE) {
             graph_params.sp_steps = params.sp_config.gen_num_per_cycle;
         }

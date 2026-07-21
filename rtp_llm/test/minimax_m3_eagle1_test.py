@@ -12,13 +12,21 @@ from rtp_llm.models.minimax_m3_eagle1 import (
     _external_lm_head_path,
     _load_external_lm_head,
 )
-from rtp_llm.models_py.model_desc.generic_moe import GenericMoeDecoderLayer
+from rtp_llm.models_py.model_desc.generic_moe import (
+    GenericMoeDecoderLayer,
+    GenericMoeModel,
+)
 from rtp_llm.models_py.model_desc.minimax_m3 import (
     MiniMaxM3DecoderLayer,
-    _MiniMaxM3ModelMixin,
+    MiniMaxM3Model,
+    _expand_target_verify_rows,
+    _target_verify_width,
+    _validate_target_verify_replay_shape,
 )
 from rtp_llm.models_py.model_desc.minimax_m3_eagle1 import MiniMaxM3Eagle1Model
 from rtp_llm.models_py.modules.hybrid.msa_attention import (
+    MSAAttention,
+    _build_target_verify_token_metadata,
     _repeat_request_block_table_for_verify_tokens,
 )
 
@@ -180,49 +188,136 @@ class DecoderAttentionHookTest(unittest.TestCase):
         self.assertNotIn("fmha_impl", attention.kwargs)
 
 
-class TargetVerifyAttentionInputsTest(unittest.TestCase):
-    def test_expands_request_metadata_for_multi_token_decode(self):
-        inputs = SimpleNamespace(
-            is_target_verify=True,
-            prefix_lengths=torch.tensor([10, 20], dtype=torch.int32),
-            total_tokens=6,
-            is_prefill=True,
-            sequence_lengths_plus_1_d=None,
-            decode_cu_seqlens_d=None,
-            cu_seqlens=None,
+class TargetVerifyAttentionContractTest(unittest.TestCase):
+    def test_minimax_uses_shared_attention_contract_outside_target_verify(self):
+        self.assertFalse(
+            hasattr(MiniMaxM3Model, "prepare_target_verify_attention_inputs")
         )
+        model = object.__new__(MiniMaxM3Model)
+        torch.nn.Module.__init__(model)
+        inputs = SimpleNamespace(
+            attention_inputs=SimpleNamespace(is_target_verify=False)
+        )
+        with patch.object(
+            GenericMoeModel, "prepare_fmha_impl", return_value="shared"
+        ) as shared_prepare:
+            actual = model.prepare_fmha_impl(inputs, is_cuda_graph=True)
 
-        actual = _MiniMaxM3ModelMixin.prepare_target_verify_attention_inputs(
-            None, inputs
+        self.assertEqual(actual, "shared")
+        shared_prepare.assert_called_once_with(inputs, True)
+
+    def test_expands_request_metadata_for_target_verify_attention(self):
+        prefix_lengths = torch.tensor([3, 7], dtype=torch.int32)
+        block_table = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32)
+
+        sequence_lengths, token_block_table = _expand_target_verify_rows(
+            prefix_lengths, block_table, verify_tokens=3
         )
 
         torch.testing.assert_close(
-            actual.sequence_lengths_plus_1_d,
-            torch.tensor([11, 12, 13, 21, 22, 23], dtype=torch.int32),
+            sequence_lengths,
+            torch.tensor([4, 5, 6, 8, 9, 10], dtype=torch.int32),
         )
         torch.testing.assert_close(
-            actual.decode_cu_seqlens_d, torch.tensor([0, 3, 6], dtype=torch.int32)
+            token_block_table,
+            torch.tensor(
+                [
+                    [11, 12],
+                    [11, 12],
+                    [11, 12],
+                    [21, 22],
+                    [21, 22],
+                    [21, 22],
+                ],
+                dtype=torch.int32,
+            ),
         )
-        self.assertTrue(actual.is_prefill)
 
-    def test_target_verify_does_not_fall_back_to_prefill_attention(self):
-        model = SimpleNamespace(
-            config=SimpleNamespace(getAttentionConfigs=lambda _: object()),
-            parallelism_config=object(),
+    def test_masks_cuda_graph_padding_rows(self):
+        sequence_lengths, _ = _expand_target_verify_rows(
+            torch.tensor([3, 0], dtype=torch.int32),
+            torch.tensor([[11, 12], [0, 0]], dtype=torch.int32),
+            verify_tokens=2,
+            valid_requests=torch.tensor([True, False]),
         )
-        inputs = SimpleNamespace(
-            attention_inputs=SimpleNamespace(is_target_verify=True)
+
+        torch.testing.assert_close(
+            sequence_lengths,
+            torch.tensor([4, 5, 0, 0], dtype=torch.int32),
         )
+
+    def test_derives_verify_width_from_flat_token_window(self):
+        attn_inputs = SimpleNamespace(
+            prefix_lengths=torch.zeros(2, dtype=torch.int32), total_tokens=6
+        )
+
+        self.assertEqual(_target_verify_width(attn_inputs), 3)
+
+    def test_derives_verify_width_from_cuda_graph_capture_placeholder(self):
+        attn_inputs = SimpleNamespace(
+            prefix_lengths=torch.zeros(2, dtype=torch.int32),
+            input_lengths=torch.full((2,), 4, dtype=torch.int32),
+            total_tokens=0,
+        )
+
+        self.assertEqual(_target_verify_width(attn_inputs), 4)
+
+    def test_rejects_variable_width_cuda_graph_capture_placeholder(self):
+        attn_inputs = SimpleNamespace(
+            prefix_lengths=torch.zeros(2, dtype=torch.int32),
+            input_lengths=torch.tensor([4, 3], dtype=torch.int32),
+            total_tokens=0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "one fixed width"):
+            _target_verify_width(attn_inputs)
+
+    def test_rejects_non_rectangular_verify_window(self):
+        attn_inputs = SimpleNamespace(
+            prefix_lengths=torch.zeros(2, dtype=torch.int32), total_tokens=5
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "divisible by request rows"):
+            _target_verify_width(attn_inputs)
+
+    def test_replay_keeps_capture_width_for_partially_filled_batch_bucket(self):
+        attn_inputs = SimpleNamespace(
+            prefix_lengths=torch.zeros(4, dtype=torch.int32), total_tokens=12
+        )
+
+        _validate_target_verify_replay_shape(attn_inputs, verify_tokens=4)
+
+    def test_replay_rejects_incomplete_request_window(self):
+        attn_inputs = SimpleNamespace(
+            prefix_lengths=torch.zeros(8, dtype=torch.int32), total_tokens=27
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "incomplete request window"):
+            _validate_target_verify_replay_shape(attn_inputs, verify_tokens=4)
+
+    def test_minimax_target_verify_selects_model_local_impl(self):
+        calls = []
+
+        class FakeTargetVerifyImpl:
+            def __init__(self, attn_configs, attn_inputs, parallelism_config):
+                calls.append((attn_configs, attn_inputs, parallelism_config))
+
+        model = object.__new__(MiniMaxM3Model)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(getAttentionConfigs=lambda tp_size: tp_size)
+        model.parallelism_config = "parallelism"
+        attn_inputs = SimpleNamespace(is_target_verify=True, is_cuda_graph=False)
+        inputs = SimpleNamespace(attention_inputs=attn_inputs)
 
         with patch(
-            "rtp_llm.models_py.modules.factory.attention.cuda_impl."
-            "py_flashinfer_mha.PyFlashinferSpecDecodeImpl.support",
-            return_value=False,
+            "rtp_llm.models_py.model_desc.minimax_m3._target_verify_impl_class",
+            return_value=FakeTargetVerifyImpl,
         ):
-            with self.assertRaisesRegex(
-                RuntimeError, "requires the FlashInfer speculative decode"
-            ):
-                _MiniMaxM3ModelMixin.prepare_fmha_impl(model, inputs)
+            actual = model.prepare_fmha_impl(inputs, is_cuda_graph=True)
+
+        self.assertIsInstance(actual, FakeTargetVerifyImpl)
+        self.assertEqual(calls, [(1, attn_inputs, "parallelism")])
+        self.assertTrue(attn_inputs.is_cuda_graph)
 
 
 class TargetVerifyBlockTableTest(unittest.TestCase):
@@ -247,6 +342,71 @@ class TargetVerifyBlockTableTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "block table batch mismatch"):
             _repeat_request_block_table_for_verify_tokens(
                 torch.zeros((1, 3), dtype=torch.int32), batch_size=2, total_tokens=2
+            )
+
+    def test_msa_selects_existing_grouped_kernel_table_locally(self):
+        attention = object.__new__(MSAAttention)
+        attention.layer_idx = 3
+        attention.page_size = 128
+        attention.physical_page_size = 128
+        group0 = torch.tensor([[1, 2]], dtype=torch.int32)
+        group1 = torch.tensor([[3, 4]], dtype=torch.int32)
+        inputs = SimpleNamespace(
+            kv_cache_layer_to_group=torch.tensor([0, 0, 0, 1]),
+            kv_cache_kernel_block_id_device_by_group=[group0, group1],
+            kv_cache_block_id_device=None,
+            kv_cache_kernel_block_id_device=group0,
+        )
+
+        self.assertIs(attention._physical_block_table(inputs), group1)
+
+    def test_msa_rejects_kernel_table_as_physical_table_for_different_page_sizes(self):
+        attention = object.__new__(MSAAttention)
+        attention.layer_idx = 0
+        attention.page_size = 64
+        attention.physical_page_size = 128
+        inputs = SimpleNamespace(
+            kv_cache_layer_to_group=torch.tensor([0]),
+            kv_cache_kernel_block_id_device_by_group=[
+                torch.tensor([[1, 2]], dtype=torch.int32)
+            ],
+            kv_cache_block_id_device=None,
+            kv_cache_kernel_block_id_device=torch.tensor([[1, 2]], dtype=torch.int32),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "physical page table"):
+            attention._physical_block_table(inputs)
+
+
+class TargetVerifyTokenMetadataTest(unittest.TestCase):
+    def test_expands_request_positions_and_masks_cuda_graph_padding(self):
+        positions, sequence_lengths, valid_tokens = _build_target_verify_token_metadata(
+            prefix_lengths=torch.tensor([10, 20, 0], dtype=torch.int32),
+            input_lengths=torch.tensor([3, 3, 0], dtype=torch.int32),
+            total_tokens=9,
+            device=torch.device("cpu"),
+        )
+
+        torch.testing.assert_close(
+            positions,
+            torch.tensor([10, 11, 12, 20, 21, 22, 0, 1, 2], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            sequence_lengths,
+            torch.tensor([11, 12, 13, 21, 22, 23, 0, 0, 0], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            valid_tokens,
+            torch.tensor([True, True, True, True, True, True, False, False, False]),
+        )
+
+    def test_rejects_input_length_batch_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "input length batch mismatch"):
+            _build_target_verify_token_metadata(
+                prefix_lengths=torch.zeros(2, dtype=torch.int32),
+                input_lengths=torch.ones(1, dtype=torch.int32),
+                total_tokens=4,
+                device=torch.device("cpu"),
             )
 
 

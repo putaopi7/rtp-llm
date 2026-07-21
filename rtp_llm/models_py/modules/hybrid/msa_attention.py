@@ -105,6 +105,40 @@ def _repeat_request_block_table_for_verify_tokens(
     return block_table.repeat_interleave(verify_tokens, dim=0)
 
 
+def _build_target_verify_token_metadata(
+    prefix_lengths: torch.Tensor,
+    input_lengths: torch.Tensor,
+    total_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expand request-row target-verify metadata into token-row MSA metadata."""
+    batch_size = int(prefix_lengths.numel())
+    if batch_size <= 0 or total_tokens % batch_size != 0:
+        raise RuntimeError(
+            "MSA target verify expects flat [batch * verify_tokens, hidden] input; "
+            f"got tokens={total_tokens}, batch={batch_size}"
+        )
+    if int(input_lengths.numel()) != batch_size:
+        raise RuntimeError(
+            "MSA target verify input length batch mismatch: "
+            f"input_lengths={input_lengths.numel()}, batch={batch_size}"
+        )
+
+    verify_tokens = total_tokens // batch_size
+    prefix = prefix_lengths.to(device=device, dtype=torch.int64)
+    relative_positions = torch.arange(verify_tokens, device=device, dtype=torch.int64)
+    positions_i64 = (prefix[:, None] + relative_positions[None, :]).reshape(-1)
+
+    # Decode CUDA Graph may replay a larger captured batch bucket. The shared
+    # runner marks padded request rows with input_lengths == 0.
+    valid_requests = input_lengths.to(device=device) > 0
+    valid_tokens = valid_requests[:, None].expand(batch_size, verify_tokens).reshape(-1)
+    sequence_lengths = torch.where(
+        valid_tokens, positions_i64 + 1, torch.zeros_like(positions_i64)
+    )
+    return positions_i64.to(torch.int32), sequence_lengths.to(torch.int32), valid_tokens
+
+
 # ----------------------------------------------------------------------------
 # Fused QKV split + RoPE(K) + pack for CP prefill.
 #
@@ -1469,6 +1503,7 @@ class MSAAttention(nn.Module):
         self.q_size = self.head_num * self.head_dim
         self.kv_size = self.kv_head_num * self.head_dim
         self.page_size = attn_config.kernel_tokens_per_block
+        self.physical_page_size = attn_config.tokens_per_block
 
         # --- main GQA branch (identical construction to CausalAttention) ---
         self.qkv_proj = LinearFactory.create_linear_from_weights(
@@ -1630,7 +1665,7 @@ class MSAAttention(nn.Module):
         )
 
         return reshape_paged_kv_cache(
-            base, self.kv_head_num, self.page_size, self.head_dim
+            base, self.kv_head_num, self.physical_page_size, self.head_dim
         )
 
     def _check_paged_decode_static(self, kv_cache: LayerKVCache) -> bool:
@@ -1638,6 +1673,7 @@ class MSAAttention(nn.Module):
             kv_cache is None
             or self._kv_sharded
             or int(self.page_size) != int(self.block_size)
+            or int(self.page_size) != int(self.physical_page_size)
             or (not self.disable_index_value)
         ):
             return False
@@ -1945,11 +1981,7 @@ class MSAAttention(nn.Module):
         return kpv, vpv
 
     def _physical_block_table(self, attn_inputs: PyAttentionInputs) -> torch.Tensor:
-        """Return this layer's physical paged-cache block table.
-
-        Hybrid cache groups own distinct physical tables. Resolve the owning
-        group locally without mutating the shared attention input object.
-        """
+        """Resolve this MSA layer's page table from shared request metadata."""
         gid = 0
         layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
         if (
@@ -1958,13 +1990,21 @@ class MSAAttention(nn.Module):
         ):
             gid = int(layer_to_group[self.layer_idx].item())
 
-        physical_tables = getattr(
-            attn_inputs, "kv_cache_block_id_device_by_group", None
+        # MSA uses 128-token physical and kernel pages, so the framework's
+        # existing per-group kernel block table is also the physical page table.
+        grouped_tables = getattr(
+            attn_inputs, "kv_cache_kernel_block_id_device_by_group", None
         )
-        if physical_tables is not None and len(physical_tables) > gid:
-            physical_table = physical_tables[gid]
-            if isinstance(physical_table, torch.Tensor) and physical_table.numel() > 0:
-                return physical_table
+        if grouped_tables is not None and len(grouped_tables) > gid:
+            if self.page_size != self.physical_page_size:
+                raise RuntimeError(
+                    "MSA cannot use a kernel block table as a physical page table when "
+                    f"kernel_page_size={self.page_size} differs from "
+                    f"physical_page_size={self.physical_page_size}"
+                )
+            group_table = grouped_tables[gid]
+            if isinstance(group_table, torch.Tensor) and group_table.numel() > 0:
+                return group_table
 
         phys = getattr(attn_inputs, "kv_cache_block_id_device", None)
         if isinstance(phys, torch.Tensor) and phys.numel() > 0:
@@ -2032,7 +2072,7 @@ class MSAAttention(nn.Module):
         transient MSA scratch and scheduler-provided paged cache. It keeps the
         paged store contract and avoids the side-cache fallback.
         """
-        base = kv_cache.kv_cache_base
+        base = self._paged_kv_base_view(kv_cache)
         if base is None or base.dim() != 5:
             raise RuntimeError(
                 "MSA paged main K/V requires a 5-D paged cache "
@@ -2097,7 +2137,7 @@ class MSAAttention(nn.Module):
         The fused Triton scatter also replaces PyTorch advanced-index writes
         and the slot_mapping >= 0 mask/nonzero path for idx_K persistence.
         """
-        base = kv_cache.kv_cache_base
+        base = self._paged_kv_base_view(kv_cache)
         if base is None or base.dim() != 5:
             raise RuntimeError(
                 "MSA paged main K/V requires a 5-D paged cache "
@@ -2116,8 +2156,7 @@ class MSAAttention(nn.Module):
                 f"act={idx_k.dtype} (scale region is reinterpreted as bf16)"
             )
 
-        # FP8-aware paged write (Triton scatter casts bf16 -> e4m3 for an fp8 pool;
-        # the tuned C++ writer is used only when dtypes match).
+        # The C++ writer handles matching dtypes and bf16/half/float -> e4m3.
         _write_main_kv_to_paged(k, v, base, slot_mapping)
 
         scratch_slots = int(self._scratch_slots)
@@ -2170,7 +2209,7 @@ class MSAAttention(nn.Module):
           full sequence (``k``/``v`` are the full sequence in CP prefill).
         * not sharded (non-CP prefill, or the original decode path): the full
           active history is read back from the persistent paged pool."""
-        base = kv_cache.kv_cache_base
+        base = self._paged_kv_base_view(kv_cache)
         if base is None or base.dim() != 5:
             raise RuntimeError(
                 "MSA paged main K/V requires a 5-D paged cache "
@@ -3124,7 +3163,7 @@ class MSAAttention(nn.Module):
             self._should_use_mxfp8_fused_qkv_idx_decode(x_fp8, x_scale)
             and not pool_is_fp8
         ):
-            paged_kv_base = kv_cache.kv_cache_base
+            paged_kv_base = self._paged_kv_base_view(kv_cache)
             scale = kv_cache.kv_scale_base
             paged_idx_k = scale.view(torch.bfloat16).view(
                 int(scale.shape[0]), int(self.page_size), int(self.idx_head_dim)
@@ -3215,7 +3254,7 @@ class MSAAttention(nn.Module):
             output = all_reduce(output, group=Group.TP)
         return output
 
-    def _forward_target_verify_decode(
+    def _forward_target_verify(
         self,
         hidden_states: torch.Tensor,
         attn_inputs: PyAttentionInputs,
@@ -3238,31 +3277,18 @@ class MSAAttention(nn.Module):
         total_tokens = int(hidden_states.shape[0])
         device = hidden_states.device
         batch_size = int(attn_inputs.prefix_lengths.numel())
-        seq_lens_src = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
-        if batch_size <= 0 or total_tokens % batch_size != 0:
-            raise RuntimeError(
-                "MSA target verify expects flat [batch * verify_tokens, hidden] input; "
-                f"got tokens={total_tokens}, batch={batch_size}"
-            )
-        verify_tokens = total_tokens // batch_size
-
         phys_block_table = _repeat_request_block_table_for_verify_tokens(
             self._physical_block_table(attn_inputs), batch_size, total_tokens
         )
 
-        if (
-            isinstance(seq_lens_src, torch.Tensor)
-            and seq_lens_src.numel() >= total_tokens
-        ):
-            seq_lens = seq_lens_src[:total_tokens].to(device=device, dtype=torch.int32)
-            positions = torch.clamp(seq_lens.to(torch.int64) - 1, min=0).to(torch.int32)
-        else:
-            prefix = attn_inputs.prefix_lengths.to(device=device, dtype=torch.int64)
-            rel_pos = torch.arange(verify_tokens, device=device, dtype=torch.int64)
-            positions_i64 = (prefix[:, None] + rel_pos[None, :]).reshape(-1)
-            positions = positions_i64.to(torch.int32)
-            seq_lens = (positions_i64 + 1).to(torch.int32)
-        valid_token_mask = seq_lens > 0
+        # The shared target-verify contract remains request-row based. Expand it
+        # only inside MiniMax-M3 MSA, immediately before the sparse operator.
+        positions, seq_lens, valid_token_mask = _build_target_verify_token_metadata(
+            attn_inputs.prefix_lengths,
+            attn_inputs.input_lengths,
+            total_tokens,
+            device,
+        )
 
         if x_fp8 is not None and x_scale is not None:
             qkv = self.qkv_proj(x_fp8, input_scales=x_scale)
@@ -3350,7 +3376,7 @@ class MSAAttention(nn.Module):
         ), "MSAAttention requires a block table"
 
         if bool(getattr(attn_inputs, "is_target_verify", False)):
-            return self._forward_target_verify_decode(
+            return self._forward_target_verify(
                 hidden_states,
                 attn_inputs,
                 kv_cache,

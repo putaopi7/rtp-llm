@@ -96,34 +96,6 @@ torch::TensorOptions runtimeCudaI32Options() {
     return runtimeCudaOptions(torch::kInt32);
 }
 
-bool hasContextRequest(const GptModelInputs& inputs) {
-    return inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0);
-}
-
-std::vector<torch::Tensor> physicalBlockTablesOnDevice(const torch::Tensor& block_ids, bool non_blocking) {
-    std::vector<torch::Tensor> tables;
-    if (!block_ids.defined()) {
-        return tables;
-    }
-    RTP_LLM_CHECK_WITH_INFO(block_ids.dim() == 2 || block_ids.dim() == 3, "kv_cache_block_id shape should be 2 or 3");
-    const size_t group_count = block_ids.dim() == 3 ? block_ids.size(0) : 1;
-    tables.reserve(group_count);
-    for (size_t group = 0; group < group_count; ++group) {
-        torch::Tensor table = block_ids.dim() == 3 ? block_ids[group] : block_ids;
-        if (table.dtype() != torch::kInt32) {
-            table = table.to(torch::kInt32);
-        }
-        if (!table.is_contiguous()) {
-            table = table.contiguous();
-        }
-        if (!table.is_cuda()) {
-            table = table.to(runtimeCudaI32Options(), non_blocking);
-        }
-        tables.push_back(std::move(table));
-    }
-    return tables;
-}
-
 void checkRuntimeCudaDevice(const torch::Tensor& tensor, const char* name) {
     if (!tensor.defined() || !tensor.is_cuda()) {
         return;
@@ -421,14 +393,14 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         py_attn_inputs.combo_position_ids = tensorHoldHostAndToCuda(inputs.combo_position_ids);
     }
 
+    // Calculate cu_seqlens
+    int    batch_size                 = py_attn_inputs.input_lengths.size(0);
+    size_t context_batch_size         = py_attn_inputs.prefix_lengths.size(0);
+    size_t decode_batch_size          = py_attn_inputs.sequence_lengths.size(0);
+    py_attn_inputs.dtype              = dataTypeToTorchType(description_.data_type);
+    py_attn_inputs.is_prefill         = !decode_batch_size;
     py_attn_inputs.is_target_verify   = inputs.is_target_verify;
     py_attn_inputs.mtp_iteration_step = inputs.mtp_iteration_step;
-
-    // Calculate cu_seqlens
-    int    batch_size         = py_attn_inputs.input_lengths.size(0);
-    size_t context_batch_size = py_attn_inputs.prefix_lengths.size(0);
-    size_t decode_batch_size  = py_attn_inputs.sequence_lengths.size(0);
-    py_attn_inputs.dtype      = dataTypeToTorchType(description_.data_type);
     RTP_LLM_CHECK_WITH_INFO(
         context_batch_size + decode_batch_size == batch_size,
         "batch size check failed context_batch_size[%ld] decode_batch_size[%ld] total_batch_size[%ld]",
@@ -436,15 +408,21 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         decode_batch_size,
         batch_size);
 
-    // PyWrappedModel does not support a mixed prefill+decode batch.
-    // The scheduler must drain decode before adding context when the Python model path is enabled.
+    // Defensive guard: PyWrappedModel currently does not support a mixed prefill+decode batch.
+    // The cu_seqlens slice assignment below assumes input_lengths.cumsum spans only context streams,
+    // but input_lengths actually has shape [decode + context]. When both are non-zero the sizes
+    // mismatch (slice=[context_batch_size] vs cumsum=[batch_size]) and copy_ throws an opaque
+    // PyTorch broadcast error. Failing here gives an actionable message and also catches any
+    // future scheduler regression that lets a mixed batch reach the python model path. Schedulers
+    // that talk to py_model are expected to drain decode before adding context (see
+    // FIFOScheduler::evaluateRunningBatch and GatherBatchScheduler::schedule's
+    // python_model_busy guard).
     RTP_LLM_CHECK_WITH_INFO(context_batch_size == 0 || decode_batch_size == 0,
                             "PyWrappedModel received a mixed prefill+decode batch which is not supported: "
                             "context_batch_size[%ld] decode_batch_size[%ld]. The scheduler must keep prefill and "
                             "decode batches separate when load_python_model is enabled.",
                             context_batch_size,
                             decode_batch_size);
-    py_attn_inputs.is_prefill = !decode_batch_size;
 
     if (context_batch_size > 0) {
         RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(context_metadata)");
@@ -471,9 +449,10 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         py_attn_inputs.cu_seqlens          = torch::zeros({batch_size + 1}, cuda_i32);
         py_attn_inputs.cu_kv_seqlens       = torch::zeros({batch_size + 1}, cuda_i32);
         py_attn_inputs.padding_offset      = torch::empty({0}, cuda_i32);
-        py_attn_inputs.decode_cu_seqlens_d = torch::arange(0, decode_batch_size + 1, 1, cuda_i32);
+        py_attn_inputs.decode_cu_seqlens_d = torch::arange(0, py_attn_inputs.sequence_lengths.size(0) + 1, 1, cuda_i32);
     }
 
+    // In qwen3-next target verify mode, sequence_lengths_plus_1_d uses prefix_lengths
     {
         RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(sequence_lengths_plus_1)");
         if (py_attn_inputs.is_target_verify && inputs.sequence_lengths_plus_1.defined()) {
@@ -483,12 +462,6 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         } else {
             py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(sequence_lengths_src);
         }
-    }
-
-    if (py_attn_inputs.is_target_verify && has_target_verify_attention_input_hook_) {
-        py::gil_scoped_acquire gil;
-        auto                   prepared = py_model_.attr("prepare_target_verify_attention_inputs")(py_attn_inputs);
-        py_attn_inputs                  = prepared.cast<torch_ext::PyAttentionInputs>();
     }
 
     if (pdDebugEnabled()) {
@@ -601,12 +574,6 @@ void PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs
 
     // Legacy 2-D device field defaults to group 0.
     py_attn_inputs.kv_cache_kernel_block_id_device = py_attn_inputs.kv_cache_kernel_block_id_device_by_group[0];
-
-    py_attn_inputs.kv_cache_block_id_device_by_group.clear();
-    if (requires_grouped_physical_kv_tables_) {
-        py_attn_inputs.kv_cache_block_id_device_by_group =
-            physicalBlockTablesOnDevice(inputs.kv_cache_block_id, /*non_blocking=*/true);
-    }
 
     // Gate host materialization: MHA reads device fields only, while MLA/
     // SparseMLA/ROCm/CP paths still consume the singular host block table.
@@ -738,10 +705,9 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(torch::Tensor         hidd
                                                       bool                  skip_final_layernorm,
                                                       size_t                num_valid_tokens) {
     RTP_LLM_PROFILE_SCOPE("py_model.callForwardPostLayers");
-    size_t     num_input_tokens    = num_valid_tokens != -1 ? num_valid_tokens : inputs.combo_tokens.size(0);
-    const bool has_context_request = hasContextRequest(inputs);
+    size_t num_input_tokens = num_valid_tokens != -1 ? num_valid_tokens : inputs.combo_tokens.size(0);
     return forwardPostLayers(hidden_states,
-                             has_context_request,
+                             inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0),
                              inputs.need_all_logits,
                              inputs.lm_output_indexes,
                              false,
@@ -1058,12 +1024,6 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
     }
     attention_inputs_.kv_cache_kernel_block_id_device = attention_inputs_.kv_cache_kernel_block_id_device_by_group[0];
 
-    attention_inputs_.kv_cache_block_id_device_by_group.clear();
-    if (requires_grouped_physical_kv_tables_) {
-        attention_inputs_.kv_cache_block_id_device_by_group =
-            physicalBlockTablesOnDevice(inputs.kv_cache_block_id, /*non_blocking=*/false);
-    }
-
     if (inputs.kv_cache_block_id.defined()) {
         torch::Tensor physical_group0;
         if (inputs.kv_cache_block_id.dim() == 3) {
@@ -1223,7 +1183,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             cache_store_async_writer_->waitAllDone();
         }
 
-        const bool has_context_request = hasContextRequest(inputs);
+        const bool has_context_request = inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0);
         if (!(device_props_.enable_prefill_cp && has_context_request) && inputs.mtp_iteration_step == 0
             && inputs.lm_output_indexes.defined() && inputs.lm_output_indexes.numel() > 0 && hidden_states.defined()
             && hidden_states.dim() > 0) {
@@ -1240,9 +1200,10 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         // this by reusing the standard "has any context stream" test
         // already used by callForwardPostLayers.
         if (device_props_.enable_prefill_cp && has_context_request) {
-            // MTP target verification keeps a pre-norm hidden buffer used by
-            // the next draft step. Gather that buffer through CP before applying
-            // the normal CP output handling to the post-layer hidden states.
+            // REBASE CONFLICT CONTEXT(3a29591e6): new base added the
+            // last-hidden-only CP gather fast path; source branch gathered the
+            // MTP pre-norm hidden buffer before normal CP output handling. Run
+            // the MTP buffer gather first, then keep the new base fast path.
             torch::Tensor mtp_hidden_states;
             if (hidden_states.defined() && hidden_states.dim() == 2 && hidden_states.size(0) > 0) {
                 mtp_hidden_states = getMtpTargetHiddenStates(hidden_states.size(0));
@@ -1563,8 +1524,8 @@ MicroBatchPlan PyWrappedModel::planMicroBatches(const GptModelInputs& inputs) {
 
     const auto&  input_lengths      = inputs.input_lengths;
     const auto&  sequence_lengths   = inputs.sequence_lengths;
-    const size_t decoder_batch_size = hasContextRequest(inputs) ? sequence_lengths.size(0) : input_lengths.size(0);
-    const size_t context_batch_size = hasContextRequest(inputs) ? input_lengths.size(0) - decoder_batch_size : 0;
+    const size_t decoder_batch_size = sequence_lengths.size(0);
+    const size_t context_batch_size = input_lengths.size(0) - decoder_batch_size;
     // TODO(async): layer micro-batch planning still needs host lengths for
     // split arithmetic. Keep the CPU mirror explicit while model inputs stay CUDA.
     const auto input_lengths_host = input_lengths.is_cuda() ? input_lengths.cpu().pin_memory() : input_lengths;

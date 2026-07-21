@@ -298,11 +298,10 @@ struct PyAttentionInputs {
     // Shape: [group, batch, max_blocks] or [batch, max_blocks].
     torch::Tensor kv_cache_block_id_host;
     torch::Tensor kv_cache_block_id_device;
-    // Hybrid cache support: per-group CUDA kernel-granularity and physical
-    // block tables. Legacy CPU consumers keep using the singular group-0
-    // host tables.
+    // Hybrid cache support: per-group CUDA kernel block tables.
+    // Legacy CPU consumers still use singular kv_cache_kernel_block_id_host,
+    // which aliases group 0.
     std::vector<torch::Tensor> kv_cache_kernel_block_id_device_by_group;
-    std::vector<torch::Tensor> kv_cache_block_id_device_by_group;
     torch::Tensor              kv_cache_layer_to_group;
     caffe2::TypeMeta           dtype;
     // Cumulative sequence lengths for attention kernels (e.g. FusedRopeKVCacheDecodeOp).
