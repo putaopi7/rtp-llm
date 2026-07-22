@@ -210,9 +210,11 @@ class BackendRPCServerVisitorRouteIpsTest(unittest.IsolatedAsyncioTestCase):
 class _RetryingModelRpcClient:
     def __init__(self):
         self.attempts = 0
+        self.request_ids = []
 
-    async def enqueue(self, _input):
+    async def enqueue(self, input):
         self.attempts += 1
+        self.request_ids.append(input.request_id)
         attempt = self.attempts
         if attempt == 1:
             yield "partial-output-from-failed-attempt"
@@ -235,9 +237,11 @@ class _AlwaysFailingModelRpcClient:
     def __init__(self, error):
         self.error = error
         self.attempts = 0
+        self.request_ids = []
 
-    async def enqueue(self, _input):
+    async def enqueue(self, input):
         self.attempts += 1
+        self.request_ids.append(input.request_id)
         yield "partial-output-from-failed-attempt"
         raise self.error
 
@@ -262,6 +266,8 @@ class BackendRPCServerVisitorRetryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outputs, ["successful-output"])
         self.assertEqual(client.attempts, 2)
+        self.assertEqual(client.request_ids[0], 123)
+        self.assertNotEqual(client.request_ids[1], 123)
 
     async def test_non_streaming_replays_successful_outputs_in_order(self):
         client = _SuccessfulModelRpcClient(["first-output", "second-output"])
@@ -288,6 +294,7 @@ class BackendRPCServerVisitorRetryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outputs, [])
         self.assertEqual(client.attempts, 2)
+        self.assertEqual(len(set(client.request_ids)), 2)
 
     async def test_non_streaming_non_retryable_error_does_not_retry(self):
         client = _AlwaysFailingModelRpcClient(ValueError("bad output"))

@@ -567,6 +567,7 @@ class MasterBatchEndToEndPerformanceTest extends FlexLBMockTestBase {
                 .addAllBlockCacheKeys(template.blockCacheKeys())
                 .setSeqLen(template.seqLen())
                 .setRequestTimeMs(System.currentTimeMillis())
+                .setGenerateTimeout(120_000L)
                 .setMaxNewTokens(template.maxNewTokens())
                 .setNumBeams(1)
                 .setModel(template.model())

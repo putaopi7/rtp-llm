@@ -31,6 +31,8 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class DefaultBatchDispatcherTest {
@@ -76,6 +78,81 @@ class DefaultBatchDispatcherTest {
         assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS), "onSuccess should be called");
         assertEquals(1, callback.successCount.get());
         assertEquals(0, callback.failureCount.get());
+    }
+
+    @Test
+    void dispatchUsesConfiguredDeadlineWhenAbsoluteDeadlineIsMissing() throws Exception {
+        PrefillEndpoint prefillEp = createPrefillEndpoint();
+        BatchItem item = createBatchItem(1L, 500, 200, prefillEp);
+        AtomicReference<Long> capturedDeadlineMs = new AtomicReference<>();
+        when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any(), anyLong()))
+                .thenAnswer(invocation -> {
+                    capturedDeadlineMs.set(invocation.getArgument(3));
+                    return CompletableFuture.completedFuture(ackResponse(1L, List.of(1L)));
+                });
+
+        dispatcher.dispatch(List.of(item), prefillEp, 1L, 100, "test", callback);
+
+        assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
+        assertEquals(0L, item.absoluteDeadlineMs());
+        assertEquals(5000L, capturedDeadlineMs.get());
+    }
+
+    @Test
+    void dispatchClampsConfiguredDeadlineToAbsoluteDeadline() throws Exception {
+        PrefillEndpoint prefillEp = createPrefillEndpoint();
+        long absoluteDeadlineMs = System.currentTimeMillis() + 2000;
+        BatchItem item = createBatchItem(1L, 500, 200, prefillEp, absoluteDeadlineMs);
+        AtomicReference<Long> capturedDeadlineMs = new AtomicReference<>();
+        when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any(), anyLong()))
+                .thenAnswer(invocation -> {
+                    capturedDeadlineMs.set(invocation.getArgument(3));
+                    return CompletableFuture.completedFuture(ackResponse(1L, List.of(1L)));
+                });
+
+        dispatcher.dispatch(List.of(item), prefillEp, 1L, 100, "test", callback);
+
+        assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
+        assertTrue(capturedDeadlineMs.get() > 0);
+        assertTrue(capturedDeadlineMs.get() <= 2000);
+    }
+
+    @Test
+    void dispatchSkipsGrpcWhenAbsoluteDeadlineAlreadyExpired() throws Exception {
+        PrefillEndpoint prefillEp = createPrefillEndpoint();
+        BatchItem item = createBatchItem(
+                1L, 500, 200, prefillEp, System.currentTimeMillis() - 1);
+
+        dispatcher.dispatch(List.of(item), prefillEp, 1L, 100, "test", callback);
+
+        assertTrue(callback.failureLatch.await(5, TimeUnit.SECONDS));
+        assertEquals(1, callback.failureCount.get());
+        verify(prefillEp).releaseBatch(1L);
+        verify(grpcClient, never()).batchEnqueueAsync(
+                anyString(), anyInt(), any(), anyLong());
+    }
+
+    @Test
+    void completedItemWithExpiredDeadlineDoesNotBlockActiveItem() throws Exception {
+        PrefillEndpoint prefillEp = createPrefillEndpoint();
+        BatchItem completed = createBatchItem(
+                1L, 500, 200, prefillEp, System.currentTimeMillis() - 1);
+        completed.future().complete(null);
+        BatchItem active = createBatchItem(2L, 300, 100, prefillEp);
+        AtomicReference<Long> capturedDeadlineMs = new AtomicReference<>();
+        when(grpcClient.batchEnqueueAsync(anyString(), anyInt(), any(), anyLong()))
+                .thenAnswer(invocation -> {
+                    capturedDeadlineMs.set(invocation.getArgument(3));
+                    return CompletableFuture.completedFuture(ackResponse(1L, List.of(2L)));
+                });
+
+        dispatcher.dispatch(
+                List.of(completed, active), prefillEp, 1L, 100, "test", callback);
+
+        assertTrue(callback.successLatch.await(5, TimeUnit.SECONDS));
+        assertEquals(1, callback.successCount.get());
+        assertEquals(1, callback.failureCount.get());
+        assertEquals(5000L, capturedDeadlineMs.get());
     }
 
     @Test
@@ -245,6 +322,11 @@ class DefaultBatchDispatcherTest {
     }
 
     private BatchItem createBatchItem(long requestId, long seqLen, long hitCacheLen, PrefillEndpoint prefillEp) {
+        return createBatchItem(requestId, seqLen, hitCacheLen, prefillEp, 0L);
+    }
+
+    private BatchItem createBatchItem(long requestId, long seqLen, long hitCacheLen,
+                                      PrefillEndpoint prefillEp, long absoluteDeadlineMs) {
         Request request = new Request();
         request.setRequestId(requestId);
         request.setSeqLen(seqLen);
@@ -271,7 +353,12 @@ class DefaultBatchDispatcherTest {
         debugInfo.setHitCacheLen(hitCacheLen);
         prefill.setDebugInfo(debugInfo);
 
-        return new BatchItem(ctx, new CompletableFuture<>(), null, prefill, null, prefillEp, null, System.currentTimeMillis());
+        if (absoluteDeadlineMs == 0) {
+            return new BatchItem(ctx, new CompletableFuture<>(), null, prefill, null,
+                    prefillEp, null, System.currentTimeMillis());
+        }
+        return new BatchItem(ctx, new CompletableFuture<>(), null, prefill, null,
+                prefillEp, null, System.currentTimeMillis(), absoluteDeadlineMs);
     }
 
     private EngineRpcService.EnqueueBatchResponsePB ackResponse(long batchId, List<Long> successIds) {

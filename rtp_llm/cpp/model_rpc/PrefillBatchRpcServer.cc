@@ -42,7 +42,7 @@ grpc::Status statusFromErrorInfo(const ErrorInfo& error_info) {
     if (!error_info.hasError()) {
         return grpc::Status::OK;
     }
-    return grpc::Status(grpc::StatusCode::INTERNAL, error_info.ToString());
+    return grpc::Status(transErrorCodeToGrpc(error_info.code()), error_info.ToString());
 }
 
 void addBatchSuccess(EnqueueBatchResponsePB* response, int64_t request_id) {

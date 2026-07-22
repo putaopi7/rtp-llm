@@ -32,6 +32,13 @@ public final class BatchItem {
     private final DecodeEndpoint decodeEp;
     private final long enqueuedAtMs;
 
+    /**
+     * Absolute deadline (epoch ms) for end-to-end timeout propagation.
+     * Computed as request_time_ms + generate_timeout from the Schedule request.
+     * 0 means not set (fallback to per-stage deadline).
+     */
+    private final long absoluteDeadlineMs;
+
     /** Mutable sort key set by the batcher algorithm at offer time. */
     private volatile long sortKey;
 
@@ -42,7 +49,8 @@ public final class BatchItem {
                      ServerStatus decode,
                      PrefillEndpoint prefillEp,
                      DecodeEndpoint decodeEp,
-                     long enqueuedAtMs) {
+                     long enqueuedAtMs,
+                     long absoluteDeadlineMs) {
         this.ctx = ctx;
         this.future = future;
         this.routeResponse = routeResponse;
@@ -51,6 +59,20 @@ public final class BatchItem {
         this.prefillEp = prefillEp;
         this.decodeEp = decodeEp;
         this.enqueuedAtMs = enqueuedAtMs;
+        this.absoluteDeadlineMs = absoluteDeadlineMs;
+    }
+
+    /** Backward-compatible constructor (absoluteDeadlineMs defaults to 0 = not set). */
+    public BatchItem(BalanceContext ctx,
+                     CompletableFuture<Response> future,
+                     Response routeResponse,
+                     ServerStatus prefill,
+                     ServerStatus decode,
+                     PrefillEndpoint prefillEp,
+                     DecodeEndpoint decodeEp,
+                     long enqueuedAtMs) {
+        this(ctx, future, routeResponse, prefill, decode, prefillEp, decodeEp,
+                enqueuedAtMs, 0L);
     }
 
     // -- accessors --
@@ -63,6 +85,9 @@ public final class BatchItem {
     public PrefillEndpoint prefillEp() { return prefillEp; }
     public DecodeEndpoint decodeEp() { return decodeEp; }
     public long enqueuedAtMs() { return enqueuedAtMs; }
+
+    /** Absolute deadline (epoch ms); 0 means not set (fallback to per-stage deadline). */
+    public long absoluteDeadlineMs() { return absoluteDeadlineMs; }
 
     /** Priority queue sort key. */
     public long sortKey() { return sortKey; }
@@ -93,5 +118,4 @@ public final class BatchItem {
         return ss != null && ss.getDebugInfo() != null
                 ? ss.getDebugInfo().getHitCacheLen() : 0;
     }
-
 }
