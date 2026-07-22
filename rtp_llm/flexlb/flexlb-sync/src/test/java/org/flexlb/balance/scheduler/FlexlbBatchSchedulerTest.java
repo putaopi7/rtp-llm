@@ -253,7 +253,11 @@ class FlexlbBatchSchedulerTest {
         WorkerStatusResponse status = new WorkerStatusResponse();
         status.setRole(RoleType.DECODE);
         status.setFinishedTaskInfo(Map.of("85", finished));
-        scheduler.onWorkerStatusUpdate(status);
+        WorkerStatus workerStatus = new WorkerStatus();
+        workerStatus.setIp("10.0.0.2");
+        workerStatus.setPort(8081);
+        workerStatus.setGrpcPort(8082);
+        scheduler.onWorkerStatusUpdate(workerStatus, status);
 
         assertFalse(scheduleFuture.isDone());
         ackFuture.complete(ackFor(sentBatches.getFirst()));

@@ -42,6 +42,11 @@ public final class BatchItem {
     /** Mutable sort key set by the batcher algorithm at offer time. */
     private volatile long sortKey;
 
+    /**
+     * Full constructor with explicit sortKey.
+     * The sortKey is typically 0 at construction and set later by
+     * {@link BatcherAlgorithm#computeSortKey} via {@link #setSortKey}.
+     */
     public BatchItem(BalanceContext ctx,
                      CompletableFuture<Response> future,
                      Response routeResponse,
@@ -49,6 +54,7 @@ public final class BatchItem {
                      ServerStatus decode,
                      PrefillEndpoint prefillEp,
                      DecodeEndpoint decodeEp,
+                     long sortKey,
                      long enqueuedAtMs,
                      long absoluteDeadlineMs) {
         this.ctx = ctx;
@@ -58,8 +64,23 @@ public final class BatchItem {
         this.decode = decode;
         this.prefillEp = prefillEp;
         this.decodeEp = decodeEp;
+        this.sortKey = sortKey;
         this.enqueuedAtMs = enqueuedAtMs;
         this.absoluteDeadlineMs = absoluteDeadlineMs;
+    }
+
+    /** Constructor without explicit sortKey (defaults to 0; set later by batcher). */
+    public BatchItem(BalanceContext ctx,
+                     CompletableFuture<Response> future,
+                     Response routeResponse,
+                     ServerStatus prefill,
+                     ServerStatus decode,
+                     PrefillEndpoint prefillEp,
+                     DecodeEndpoint decodeEp,
+                     long enqueuedAtMs,
+                     long absoluteDeadlineMs) {
+        this(ctx, future, routeResponse, prefill, decode, prefillEp, decodeEp,
+                0L, enqueuedAtMs, absoluteDeadlineMs);
     }
 
     /** Backward-compatible constructor (absoluteDeadlineMs defaults to 0 = not set). */

@@ -12,8 +12,9 @@ import org.flexlb.dao.loadbalance.Response;
 import org.flexlb.dao.loadbalance.ServerStatus;
 import org.flexlb.dao.loadbalance.StrategyErrorType;
 import org.flexlb.dao.master.TaskInfo;
-import org.flexlb.dao.master.WorkerStatusResponse;
+import org.flexlb.dao.master.WorkerStatus;
 import org.flexlb.dao.route.RoleType;
+import org.flexlb.dao.master.WorkerStatusResponse;
 import org.flexlb.engine.grpc.EngineGrpcClient;
 import org.flexlb.service.monitor.BatchSchedulerReporter;
 import org.flexlb.util.Logger;
@@ -53,15 +54,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Component
 public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallback {
 
-    private final ConfigService configService;
+    public final ConfigService configService;
     private final Router router;
-    private final EngineGrpcClient grpcClient;
-    private final EndpointRegistry endpointRegistry;
-    private final BatchDispatcher dispatcher;
-    private final BatchSchedulerReporter reporter;
-    private final Map<Long, InflightEntry> inflight = new ConcurrentHashMap<>();
+    final EngineGrpcClient grpcClient;
+    final EndpointRegistry endpointRegistry;
+    final BatchDispatcher dispatcher;
+    final BatchSchedulerReporter reporter;
+    final Map<Long, InflightEntry> inflight = new ConcurrentHashMap<>();
     private final Map<Long, RequestLifecycleSnapshot> terminalStates = new ConcurrentHashMap<>();
-    private final BatchIdGenerator batchIdGenerator;
+    final BatchIdGenerator batchIdGenerator;
 
     @Autowired
     public FlexlbBatchScheduler(ConfigService configService,
@@ -112,9 +113,21 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
                 return future;
             }
 
-            if (inflight.containsKey(ctx.getRequestId()) || terminalStates.containsKey(ctx.getRequestId())) {
-                completeError(future, StrategyErrorType.INVALID_REQUEST,
-                        "duplicate request_id: " + ctx.getRequestId());
+            if (inflight.containsKey(ctx.getRequestId())) {
+                InflightEntry entry = inflight.get(ctx.getRequestId());
+                Response dup = copyResponse(entry.item.routeResponse());
+                dup.setSuccess(true);
+                dup.setCode(200);
+                dup.setEnqueuedByMaster(true);
+                future.complete(dup);
+                return future;
+            }
+            if (terminalStates.containsKey(ctx.getRequestId())) {
+                Response dup = new Response();
+                dup.setSuccess(true);
+                dup.setCode(200);
+                dup.setEnqueuedByMaster(true);
+                future.complete(dup);
                 return future;
             }
 
@@ -163,14 +176,12 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
                 long requestTimeMs = ctx.getRequest().getRequestTimeMs();
                 long generateTimeout = ctx.getRequest().getGenerateTimeout();
                 if (requestTimeMs > 0 && generateTimeout > 0) {
-                    absoluteDeadlineMs = requestTimeMs > Long.MAX_VALUE - generateTimeout
-                            ? Long.MAX_VALUE
-                            : requestTimeMs + generateTimeout;
+                    absoluteDeadlineMs = requestTimeMs + generateTimeout;
                 }
             }
 
             BatchItem item = new BatchItem(ctx, future, routeResponse, copyOf(prefill), copyOf(decode),
-                    prefillEp, decodeEp, System.currentTimeMillis(),
+                    prefillEp, decodeEp, /* sortKey set by batcher */ 0, System.currentTimeMillis(),
                     absoluteDeadlineMs);
             InflightEntry entry = new InflightEntry(item);
             InflightEntry existing = inflight.putIfAbsent(ctx.getRequestId(), entry);
@@ -179,8 +190,19 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
                     inflight.remove(ctx.getRequestId(), entry);
                 }
                 rollback(item);
-                completeError(future, StrategyErrorType.INVALID_REQUEST,
-                        "duplicate request_id: " + ctx.getRequestId());
+                if (existing != null) {
+                    Response dup = copyResponse(existing.item.routeResponse());
+                    dup.setSuccess(true);
+                    dup.setCode(200);
+                    dup.setEnqueuedByMaster(true);
+                    future.complete(dup);
+                } else {
+                    Response dup = new Response();
+                    dup.setSuccess(true);
+                    dup.setCode(200);
+                    dup.setEnqueuedByMaster(true);
+                    future.complete(dup);
+                }
                 return future;
             }
             WorkerBatcher batcher = prefillEp.getBatcher();
@@ -265,7 +287,7 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
 
     // ==================== Completion from worker status ====================
 
-    public void onWorkerStatusUpdate(WorkerStatusResponse response) {
+    public void onWorkerStatusUpdate(WorkerStatus ws, WorkerStatusResponse response) {
         if (response == null) {
             return;
         }
@@ -526,8 +548,8 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
 
         if (cancelAfterAck) {
             boolean cancelled = cancelPrefill(entry);
-            repackPrefillBatch(entry);
             synchronized (entry) {
+                repackPrefillBatch(entry);
                 if (cancelled) {
                     entry.lifecycle.finishCancellation();
                 }
@@ -848,7 +870,7 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
 
     // ==================== Inflight entry ====================
 
-    private static final class InflightEntry {
+    static final class InflightEntry {
         final BatchItem item;
         final RequestLifecycle lifecycle;
         final AtomicBoolean rolledBack = new AtomicBoolean(false);

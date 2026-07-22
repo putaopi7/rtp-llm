@@ -27,6 +27,7 @@ public enum StrategyErrorType {
     NO_PDFUSION_WORKER(8404, true),
     NO_VIT_WORKER(8405, true),
     NO_FRONTEND_WORKER(8407, true),
+    DUPLICATE_REQUEST(460, false),
     INVALID_REQUEST(8406, false),
 
     // queue error

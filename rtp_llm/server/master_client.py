@@ -14,7 +14,6 @@ from rtp_llm.config.generate_config import RoleAddr, RoleType
 from rtp_llm.config.py_config_modules import MasterConfig
 from rtp_llm.cpp.model_rpc.proto.flexlb_schedule_service_pb2 import (
     CANCEL_REASON_CLIENT_CANCELLED,
-    CANCEL_REASON_DEADLINE_EXCEEDED,
     FlexlbCancelRequestPB,
     FlexlbScheduleRequestPB,
 )
@@ -208,10 +207,8 @@ class MasterClient:
                 elapsed,
             )
             if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
-                await self._best_effort_cancel(
-                    stub, request_id, CANCEL_REASON_DEADLINE_EXCEEDED
-                )
-                await self._close_channel(target)
+                # P0-2: Don't cancel or close channel — leave it for
+                # passive recovery retry with the same request_id.
                 raise FtRuntimeException(
                     exception_type=ExceptionType.DEADLINE_EXCEEDED,
                     message=f"FlexLB schedule deadline exceeded for request {request_id}",
@@ -331,9 +328,28 @@ class MasterClient:
         if input_pb is not None:
             request_pb.generate_input = input_pb.SerializeToString()
 
-        response, is_conn_phase = await self._send_schedule_request(
-            master_addr, request_pb, timeout_s, request_id
-        )
+        # P0-2: On deadline exceeded, retry the same master with the same
+        # request_id (passive recovery).  Master-side duplicate detection
+        # returns inflight routing info.
+        for schedule_attempt in range(2):
+            try:
+                response, is_conn_phase = await self._send_schedule_request(
+                    master_addr, request_pb, timeout_s, request_id
+                )
+                break
+            except FtRuntimeException as e:
+                if (
+                    e.exception_type == ExceptionType.DEADLINE_EXCEEDED
+                    and schedule_attempt == 0
+                ):
+                    route_logger.warning(
+                        "Schedule deadline exceeded, retrying same master "
+                        "(passive recovery), request_id=%s",
+                        request_id,
+                    )
+                    await asyncio.sleep(0.1)
+                    continue
+                raise
 
         if response is None and is_conn_phase and slave_addr:
             route_logger.info(
