@@ -199,6 +199,48 @@ class TestMhaRotaryEmbeddingOp(unittest.TestCase):
             print(f"Warning: Failed to initialize device: {e}")
             self.device_initialized = False
 
+    def test_kv_cache_write_converts_to_fp8_cache_dtype(self):
+        num_tokens = 4
+        num_kv_heads = 2
+        head_dim = 64
+        token_per_block = 4
+        params = RopeParams(
+            batch_indice_d=torch.zeros(num_tokens, dtype=torch.int32, device="cuda"),
+            positions_d=torch.arange(num_tokens, dtype=torch.int32, device="cuda"),
+            page_indice_d=torch.tensor([0], dtype=torch.int32, device="cuda"),
+            decode_page_indptr_d=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            paged_kv_last_page_len_d=torch.tensor(
+                [num_tokens], dtype=torch.int32, device="cuda"
+            ),
+        )
+        key = torch.linspace(
+            -1, 1, num_tokens * num_kv_heads * head_dim, device="cuda"
+        ).reshape(num_tokens, num_kv_heads, head_dim)
+        value = key.flip(0)
+        kv_cache = LayerKVCache()
+        kv_cache.kv_cache_base = torch.zeros(
+            1,
+            2,
+            num_kv_heads,
+            token_per_block,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+
+        op = KVCacheWriteOp(num_kv_heads, head_dim, token_per_block)
+        op.set_params(params)
+        op.forward(key, value, kv_cache)
+
+        torch.testing.assert_close(
+            kv_cache.kv_cache_base[0, 0].float(),
+            key.to(torch.float8_e4m3fn).permute(1, 0, 2).float(),
+        )
+        torch.testing.assert_close(
+            kv_cache.kv_cache_base[0, 1].float(),
+            value.to(torch.float8_e4m3fn).permute(1, 0, 2).float(),
+        )
+
     def test_fused_rope_vs_mha_rope(self):
         """Compare FusedRopeKVCachePrefillOpQOut (C++) vs MhaRotaryEmbeddingOp (Python)"""
         if not self.device_initialized:

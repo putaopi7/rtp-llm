@@ -58,6 +58,13 @@ class KVCacheWriteOp:
                 :, 1, :, :, :
             ]  # [num_pages, num_kv_heads, page_size, head_dim]
 
+            # FlashInfer's append kernel does not quantize mixed-dtype inputs.
+            # Convert activations explicitly before writing an FP8 KV cache.
+            if key.dtype != k_cache.dtype:
+                key = key.to(k_cache.dtype)
+            if value.dtype != v_cache.dtype:
+                value = value.to(v_cache.dtype)
+
             # Append K and V to paged cache using HND layout
             page.append_paged_kv_cache(  # type: ignore
                 key,  # append_key: [total_tokens, num_kv_heads, head_dim]
