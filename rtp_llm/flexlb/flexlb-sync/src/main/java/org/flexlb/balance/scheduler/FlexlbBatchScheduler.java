@@ -113,16 +113,24 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
                 return future;
             }
 
-            if (inflight.containsKey(ctx.getRequestId())) {
-                InflightEntry entry = inflight.get(ctx.getRequestId());
-                Response dup = copyResponse(entry.item.routeResponse());
+            InflightEntry fastPathEntry = inflight.get(ctx.getRequestId());
+            if (fastPathEntry != null) {
+                Response existingResp = fastPathEntry.item.routeResponse();
+                ServerStatus existingPrefill = findServer(existingResp, RoleType.PREFILL);
+                ServerStatus existingDecode = findServer(existingResp, RoleType.DECODE);
+                Logger.warn("Duplicate request detected (fast path), request_id={}, "
+                                + "already enqueued to prefill={}, decode={}",
+                        ctx.getRequestId(),
+                        existingPrefill != null ? existingPrefill.getServerIp() + ":" + existingPrefill.getHttpPort() : "null",
+                        existingDecode != null ? existingDecode.getServerIp() + ":" + existingDecode.getHttpPort() : "null");
+                Response dup = copyResponse(existingResp);
                 dup.setSuccess(true);
                 dup.setCode(200);
                 dup.setEnqueuedByMaster(true);
                 future.complete(dup);
                 return future;
-            }
-            if (terminalStates.containsKey(ctx.getRequestId())) {
+            } else if (terminalStates.containsKey(ctx.getRequestId())) {
+                Logger.info("Request already in terminal state, request_id={}", ctx.getRequestId());
                 Response dup = new Response();
                 dup.setSuccess(true);
                 dup.setCode(200);
@@ -191,7 +199,15 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
                 }
                 rollback(item);
                 if (existing != null) {
-                    Response dup = copyResponse(existing.item.routeResponse());
+                    Response existingResp = existing.item.routeResponse();
+                    ServerStatus existingPrefill = findServer(existingResp, RoleType.PREFILL);
+                    ServerStatus existingDecode = findServer(existingResp, RoleType.DECODE);
+                    Logger.warn("Duplicate request detected (CAS race), request_id={}, "
+                                    + "existing prefill={}, decode={}",
+                            ctx.getRequestId(),
+                            existingPrefill != null ? existingPrefill.getServerIp() + ":" + existingPrefill.getHttpPort() : "null",
+                            existingDecode != null ? existingDecode.getServerIp() + ":" + existingDecode.getHttpPort() : "null");
+                    Response dup = copyResponse(existingResp);
                     dup.setSuccess(true);
                     dup.setCode(200);
                     dup.setEnqueuedByMaster(true);
@@ -777,7 +793,7 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
     // ==================== Internal: static utilities ====================
 
     private static ServerStatus findServer(Response response, RoleType roleType) {
-        if (response.getServerStatus() == null) {
+        if (response == null || response.getServerStatus() == null) {
             return null;
         }
         for (ServerStatus serverStatus : response.getServerStatus()) {
@@ -789,6 +805,9 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
     }
 
     private static Response copyResponse(Response src) {
+        if (src == null) {
+            return null;
+        }
         Response response = new Response();
         response.setServerStatus(copyServerList(src.getServerStatus()));
         response.setSuccess(src.isSuccess());

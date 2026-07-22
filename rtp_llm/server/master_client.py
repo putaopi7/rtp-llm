@@ -331,29 +331,58 @@ class MasterClient:
         # P0-2: On deadline exceeded, retry the same master with the same
         # request_id (passive recovery).  Master-side duplicate detection
         # returns inflight routing info.
+        route_logger.debug(
+            "Schedule attempt starting, master=%s, request_id=%s, timeout=%.3fs",
+            master_addr,
+            request_id,
+            timeout_s if timeout_s is not None else -1.0,
+        )
         for schedule_attempt in range(2):
             try:
+                schedule_start = time.monotonic()
                 response, is_conn_phase = await self._send_schedule_request(
                     master_addr, request_pb, timeout_s, request_id
                 )
-                break
+                if response is not None:
+                    route_logger.info(
+                        "Schedule succeeded on attempt %d, request_id=%s, master=%s",
+                        schedule_attempt + 1,
+                        request_id,
+                        master_addr,
+                    )
+                    break
+                # response is None: connection-phase failure, fall through to slave retry
             except FtRuntimeException as e:
                 if (
                     e.exception_type == ExceptionType.DEADLINE_EXCEEDED
                     and schedule_attempt == 0
                 ):
+                    elapsed = time.monotonic() - schedule_start
                     route_logger.warning(
-                        "Schedule deadline exceeded, retrying same master "
-                        "(passive recovery), request_id=%s",
+                        "Schedule deadline exceeded after %.3fs, retrying same master "
+                        "(passive recovery), request_id=%s, master=%s, attempt=%d/2",
+                        elapsed,
                         request_id,
+                        master_addr,
+                        schedule_attempt + 1,
                     )
                     await asyncio.sleep(0.1)
                     continue
+                if e.exception_type == ExceptionType.DEADLINE_EXCEEDED:
+                    route_logger.warning(
+                        "Schedule retry exhausted (deadline exceeded on attempt %d/2), "
+                        "request_id=%s, master=%s",
+                        schedule_attempt + 1,
+                        request_id,
+                        master_addr,
+                    )
                 raise
 
         if response is None and is_conn_phase and slave_addr:
             route_logger.info(
-                "Master connection failed, retrying slave, slave=%s, " "request_id=%s",
+                "Master connection failed, retrying slave, master=%s, slave=%s, "
+                "request_id=%s",
+                master_addr,
                 slave_addr,
                 request_id,
             )
