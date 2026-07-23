@@ -178,24 +178,24 @@ void PrefillBatchRpcServer::stopAsyncResponseWorkers() {
 }
 
 void PrefillBatchRpcServer::initThreadPools() {
-    const auto& scheduler_config  = maga_init_params_.runtime_config.fifo_scheduler_config;
-    const auto& pd_sep_config     = maga_init_params_.pd_sep_config;
-    const int   max_context_batch = std::max(1, static_cast<int>(scheduler_config.max_context_batch_size));
+    const auto& concurrency_config = maga_init_params_.concurrency_config;
+    const auto& pd_sep_config      = maga_init_params_.pd_sep_config;
+    const int   concurrency_limit  = std::max(1, concurrency_config.concurrency_limit);
 
     // Slot pool: Prepare + per-stream async response runners.
     // Configurable via pd_sep_config.prefill_slot_pool_size (0 = use formula default)
     const int slot_threads = pd_sep_config.prefill_slot_pool_size > 0 ?
                                  static_cast<int>(pd_sep_config.prefill_slot_pool_size) :
-                                 std::max(16, std::min(max_context_batch * 16, 128));
+                                 8 * concurrency_limit;
     const int slot_queue   = slot_threads * 8;
 
     slot_worker_pool_ =
         std::make_shared<autil::LockFreeThreadPool>(slot_threads, slot_queue, nullptr, "PrefillSlotPool");
     RTP_LLM_CHECK_WITH_INFO(slot_worker_pool_->start(), "PrefillRpcServer slot thread pool start failed");
-    RTP_LLM_LOG_INFO("PrefillRpcServer slot pool started: threads=%d queue=%d (max_context_batch=%d)",
+    RTP_LLM_LOG_INFO("PrefillRpcServer slot pool started: threads=%d queue=%d (concurrency_limit=%d)",
                      slot_threads,
                      slot_queue,
-                     max_context_batch);
+                     concurrency_limit);
     slot_pool_metrics_.thread_max = static_cast<size_t>(slot_threads);
     slot_pool_metrics_.queue_max  = static_cast<size_t>(slot_queue);
 }
