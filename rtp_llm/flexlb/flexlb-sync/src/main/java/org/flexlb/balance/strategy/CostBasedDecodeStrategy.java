@@ -191,16 +191,27 @@ public class CostBasedDecodeStrategy implements LoadBalanceStrategy {
         double totalWeight = 0;
         boolean allSameUsage = true;
         long firstCacheUsed = cacheUsed[0];
+        // First pass: compute exponents and find the max (for numerical stability)
+        double[] exponents = new double[n];
+        double maxExponent = Double.NEGATIVE_INFINITY;
         for (int i = 0; i < n; i++) {
             if (cacheUsed[i] != firstCacheUsed) {
                 allSameUsage = false;
             }
             double normalizedValue = cacheUsed[i] - avgCacheUsed;
-            weights[i] = Math.exp(-decayFactor * normalizedValue);
+            exponents[i] = -decayFactor * normalizedValue;
+            maxExponent = Math.max(maxExponent, exponents[i]);
+        }
+        // Second pass: subtract maxExponent before exp (softmax max-subtraction trick).
+        // All exponents become <= 0, so weights fall in (0, 1] and totalWeight <= n,
+        // which cannot overflow. Sampling probabilities are unchanged since
+        // exp(x - c) = exp(x) / exp(c) is a uniform scaling.
+        for (int i = 0; i < n; i++) {
+            weights[i] = Math.exp(exponents[i] - maxExponent);
             totalWeight += weights[i];
         }
 
-        if (allSameUsage || totalWeight <= 0) {
+        if (allSameUsage || !Double.isFinite(totalWeight) || totalWeight <= 0) {
             // 所有 endpoint 使用率相同，随机选一个
             return candidateEndpoints.get(ThreadLocalRandom.current().nextInt(n));
         }
